@@ -1,0 +1,56 @@
+Recognizer - a program that identifies specific words in a stream of
+			 characters.
+
+Lexeme - the actual text for a word recognized by the scanner
+
+Microsyntax
+	- specifies how to group characters into words and, conversely,
+	  how to separate words that run together
+	- scanner applies a set of rules that describe lexical structure
+	  of the input programming language.
+
+A language is a set of _strings_. A string is a finite sequence of _symbols_.
+The symbols theselves are taken from a finite alphabet.
+
+
+A Scanner
+	- analyzes lexical structure of code
+	- its is to transform a stream of characters into a stream of
+	words in the input language
+	- words must be classified into syntactic category, or "parts of speech",
+	from the programming language's grammar
+	- touches every character in the input program
+	- for each word, it determines if the word is valid in the source
+	language.
+
+The parser
+	- fits streams of words produced by the Scanner to a grammatical model
+	of the input language.
+	- perfoms semantic elaboration routines to perform deeper analysis and
+	to build structures that model the input program's meaning
+
+The Compiler As A whole
+	- must understand lexical strucure - "spellings of words of a program"
+	- must understand syntactic structure - "the grammatical way that words
+	fit together to form statements and programs"
+	- the writer must specify the lexical structure of the input language
+	using regular expressions
+
+if (regex.char_count > 1) {
+        u64 div_pt = find_dividing_point(regex);
+        nfa fa0 = nfa_from_regex(arena, str8_substring_view(regex, 0, div_pt));
+        u8 op = regex.str[div_pt];
+        nfa fa1 = nfa_from_regex(arena, str8_substring_view(regex, div_pt + 1, regex.char_count));
+        
+        nfa combined;
+        
+        return combined;
+    } else {
+        assert_true(regex.char_count == 1);
+        nfa single = {0};
+        nfa_state *start = nfa_insert_state(arena, &single, str8_format(arena, str8("n_%llu"), single.state_count));
+        nfa_state *end = nfa_insert_state(arena, &single, str8_format(arena, str8("n_%llu"), single.state_count));
+        nfa_add_transition(arena, &single, start, regex.str[0], false, end);
+        
+        return single;
+    }
