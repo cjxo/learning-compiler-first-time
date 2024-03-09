@@ -575,6 +575,7 @@ struct nfa_accepting_node {
 };
 #endif
 
+// TODO(christian): rename this to Finite_Automata!
 typedef struct {
     nfa_state *first_state;
     nfa_state *last_state;
@@ -679,7 +680,11 @@ nfa_print_states_and_transitions(nfa *fa) {
                  transition;
                  transition = transition->next) {
                 assert_true(transition->state != null);
-                printf(" -> %c", transition->edge_label);
+                if (transition->is_epsilon_transition) {
+                    printf(" -> {%c}", transition->edge_label);
+                } else {
+                    printf(" -> %c", transition->edge_label);
+                }
                 if (transition->state->flags & NFAStateFlag_IsAccepting) {
                     printf(" -> ((%s))", transition->state->identifier.str);
                 } else {
@@ -744,7 +749,19 @@ typedef struct {
 
 fn String_Const_U8
 regex_substring_without_parens(String_Const_U8 regex, u64 start, u64 dividing_pt) {
-    if ((regex.str[0] == '(') && (regex.str[dividing_pt] == '*')) {
+    u64 paren_count = 0;
+    for (u64 char_index = 0;
+         char_index < regex.char_count;
+         char_index += 1) {
+        if ((regex.str[char_index] == '(') ||
+            (regex.str[char_index] == ')')) {
+            paren_count += 1;
+        }
+    }
+    
+    if ((regex.str[0] == '(') && ((regex.str[dividing_pt - 1] == ')')) && (paren_count == 2)) {
+        return str8_substring_view(regex, start + 1, dividing_pt - 1);
+    } else if ((regex.str[0] == '(') && (regex.str[dividing_pt] == '*')) {
         assert_true(dividing_pt > 1);
         return str8_substring_view(regex, start + 1, dividing_pt - 1);
     } else {
@@ -759,6 +776,10 @@ nfa_from_regex_inner(Memory_Arena *arena, nfa *result_nfa, String_Const_U8 regex
         single_nfa_result combined = {0};
         
         u64 div_pt = find_dividing_point(regex);
+        if (div_pt == invalid_index_u64) {
+            regex = regex_substring_without_parens(regex, 0, regex.char_count);
+            div_pt = find_dividing_point(regex);
+        }
         
         single_nfa_result fa0 = nfa_from_regex_inner(arena, result_nfa, regex_substring_without_parens(regex, 0, div_pt));
         u8 op = regex.str[div_pt];
@@ -786,7 +807,6 @@ nfa_from_regex_inner(Memory_Arena *arena, nfa *result_nfa, String_Const_U8 regex
                     _assert(!"how did you got here?");
                 } break;
             }
-            
         } else {
             combined.start = nfa_insert_state(arena, result_nfa, str8_format(arena, str8("n_%llu"), result_nfa->state_count));
             combined.end = nfa_insert_state(arena, result_nfa, str8_format(arena, str8("n_%llu"), result_nfa->state_count));
@@ -889,6 +909,8 @@ nfa_follow_epsilon(Memory_Arena *arena, nfa *fa, nfa_state *follow_from, b32 *co
     state_stack[dfs_stack_ptr++] = dfs_nodes + follow_from->index_in_list;
     dfs_nodes[follow_from->index_in_list].dfs_visit_state = DFSState_Discovered;
     
+    //nfa_state *accepting_state = fa->last_state;
+    
     while (dfs_stack_ptr) {
         dfs_node *popped_node = state_stack[dfs_stack_ptr - 1];
         assert_true(popped_node->dfs_visit_state == DFSState_Discovered);
@@ -905,7 +927,8 @@ nfa_follow_epsilon(Memory_Arena *arena, nfa *fa, nfa_state *follow_from, b32 *co
                     dfs_node *adjacent_dfs_node = dfs_nodes + adjacent_node->state->index_in_list;
                     if (adjacent_dfs_node->dfs_visit_state == DFSState_Undiscovered) {
                         adjacent_dfs_node->dfs_visit_state = DFSState_Discovered;
-                        if (adjacent_dfs_node->state->flags & NFAStateFlag_IsAccepting) {
+                        
+                        if (contains_accepting_state && (adjacent_dfs_node->state->flags & NFAStateFlag_IsAccepting)) {
                             *contains_accepting_state = true;
                         }
                         
@@ -934,8 +957,8 @@ nfa_follow_epsilon(Memory_Arena *arena, nfa *fa, nfa_state *follow_from, b32 *co
     return(result);
 }
 
-// TODO(christian): optimize this horrendous function / probably I have inflated the problem!!!!
-// TODO(christian): i dont think we need most of the stuff below, like 70%! We wasted our time! (if we indeed dont need to do those things.).
+// TODO(christian): optimize this horrendous function / Remove Unecessary code!!! 
+// TODO(christian): there is a bug. I dont know what. I might need to reread. Basically, it outputs wrong DFA for certain NFAs!
 fn nfa
 dfa_from_nfa(Memory_Arena *arena, nfa* fa) {
     Memory_Arena *scratch_memory = arena_get_scratch(&arena, 1);
@@ -1025,8 +1048,9 @@ dfa_from_nfa(Memory_Arena *arena, nfa* fa) {
                             } else {
                                 possible_configuration = e_closure_for_dequeued;
                             }
-#endif
+#else
                             possible_configuration = e_closure_for_dequeued;
+#endif
                             break;
                         }
                     }
@@ -1075,6 +1099,15 @@ dfa_from_nfa(Memory_Arena *arena, nfa* fa) {
                     new_config_list_node->config_list = possible_configuration;
                     new_config_list_node->identifier = str8_format(arena, str8("q_%llu"), config_count++);
                     sll_push_back(first_configuration, last_configuration, new_config_list_node);
+                    
+                    for (nfa_valid_configuration *test = possible_configuration;
+                         test;
+                         test = test->next) {
+                        if (test->state == fa->last_state) {
+                            contains_accepting_state = true;
+                            break;
+                        }
+                    }
                     
                     queued_equivalent = new_config_list_node;
                     
@@ -1203,57 +1236,7 @@ typedef struct {
     Hopcroft_DFA_States *last;
 } Hopcroft_Partition;
 
-// TODO(christian): confirm if this works!
-fn Hopcroft_DFA_State_Node *
-calculate_image(Memory_Arena *arena, nfa *dfa, u8 char_transition, Hopcroft_DFA_States *dequeued_states) {
-    Hopcroft_DFA_State_Node *result = null;
-    
-    for (nfa_state *state = dfa->first_state;
-         state;
-         state = state->next) {
-        nfa_transition *transitions = nfa_get_transitions_for_state(dfa, state);
-        for (nfa_transition_node *transition = transitions->transitions;
-             transition;
-             transition = transition->next) {
-            if (transition->edge_label == char_transition) {
-                b32 is_in_dequeued_states = false;
-                for (Hopcroft_DFA_State_Node *deququed_state = dequeued_states->first;
-                     deququed_state;
-                     deququed_state = deququed_state->next) {
-                    b32 is_in_result = false;
-                    for (Hopcroft_DFA_State_Node *result_node = result;
-                         result_node;
-                         result_node = result_node->next) {
-                        if (result_node->state == deququed_state->state) {
-                            is_in_result = true;
-                            break;
-                        }
-                    }
-                    
-                    if (!is_in_result && (deququed_state->state == transition->state)) {
-                        Hopcroft_DFA_State_Node *new_image_node = arena_push_struct_zero(arena, Hopcroft_DFA_State_Node);
-                        new_image_node->state = state;
-                        new_image_node->next = result;
-                        result = new_image_node;
-                        
-                        is_in_dequeued_states = true;
-                        break;
-                    }
-                }
-                
-                if (is_in_dequeued_states) {
-                    break;
-                }
-            }
-        }
-    }
-    
-    return(result);
-}
-
-//#define dll_remove(first,last,node) (((node)->prev?((node)->prev->next=(node)->next):(first)=(node)->next),(node)->next?((node)->next->prev=(node)->prev):0)
 // TODO(christian): rename nfa struct to Finite_Automata
-
 
 fn Hopcroft_DFA_States *
 hopcroft_dfa_states_copy(Memory_Arena *arena, Hopcroft_DFA_States *source) {
@@ -1269,208 +1252,259 @@ hopcroft_dfa_states_copy(Memory_Arena *arena, Hopcroft_DFA_States *source) {
     return(dest);
 }
 
-// TODO(christian): fix. reread box along with reading this!
-fn void
-dfa_minimize(Memory_Arena *arena, nfa *dfa) {
-    Memory_Arena *scratch_memory = arena_get_scratch(&arena, 1);
-    Temporary_Memory temporary_memory = temp_mem_begin(scratch_memory);
+// Hopcroft Algorithm notes:
+// - It constructs a minimal DFA from an arbitrary DFA by grouping together states into sets that are equivalent.
+// - Two DFA states are equivalent when they produce the same behavior on input string.
+// - It finds the largest possible sets of equivalent states; each set becomes a state in the minimal DFA. 
+//    - From my understanding, it condenses these equivalent states into one state.
+// - It constructs a set partition, P = { p_1, ..., p_m } of DFA states. Each p_i contains a set of equivalent
+//   DFA States. Basically, P is a set of sets! Remember this!
+// - It constructs a partition with the smallest number of sets. Here are the following rules without annoying math formalness:
+// 
+//   1. Suppose we have character c in the alphabet. Suppose we have DFA States d_i and d_j in some partition p_j in P.
+//      Suppose we have DFA states d_x and d_y such that d_i transitions to d_x with respect to character c and
+//      d_j transitions to d_y with respect to character c. Then, d_x and d_j must belong into the same partition
+//      p_t in P!
+//      - In other words, two states in the same set must, for every character c in alphabet, transition to states that are themselves, members
+//        of a single set in partition!
+// 
+//   2. Suppose we have DFA states d_i and d_j in some partition p_k in P. Then both d_i and d_j must be an accepting state!
+//      Or both d_i and d_j must be a nonaccepting state! But not both!
+//      - Any single set contains either accepting states or nonaccepting states, but not both!
+
+// - The algorithm starts with P containg two sets: {accepting states} and {all DFA states without accepting states}.
+// - The algorithm refines P's contents until both properties 1 and 2 holds for each set in P.
+// - The algorithm splits sets based on the transitions out of DFA states in the set.
+
+// NOTE(christian): the image: the set of DFA states that can reach a state in s on a transition labeled c.
+// s = transition_to
+// c = character
+fn Hopcroft_DFA_State_Node *
+dfa_get_states_that_transition_to_another_states(Memory_Arena *arena,
+                                                 nfa *dfa, u8 character,
+                                                 Hopcroft_DFA_States *transition_to) {
+    Hopcroft_DFA_State_Node *result = null;
     
-    Hopcroft_DFA_States *accepting_states[2];
-    Hopcroft_DFA_States *without_accepting_states[2];
-    
-    for (u32 accepting_state_index = 0;
-         accepting_state_index < 2;
-         ++accepting_state_index) {
-        accepting_states[accepting_state_index] = arena_push_struct_zero(scratch_memory, Hopcroft_DFA_States);
-        
-        for (nfa_state *state = dfa->first_state;
-             state;
-             state = state->next) {
-            if (state->flags & NFAStateFlag_IsAccepting) {
-                Hopcroft_DFA_State_Node *node = arena_push_struct(scratch_memory, Hopcroft_DFA_State_Node);
-                node->state = state;
-                node->next = null;
-                sll_push_back(accepting_states[accepting_state_index]->first,
-                              accepting_states[accepting_state_index]->last,
-                              node);
-            }
-        }
-    }
-    
-    for (u32 without_accepting_state_index = 0;
-         without_accepting_state_index < 2;
-         ++without_accepting_state_index) {
-        without_accepting_states[without_accepting_state_index] = arena_push_struct_zero(scratch_memory, Hopcroft_DFA_States);
-        
-        for (nfa_state *state = dfa->first_state;
-             state;
-             state = state->next) {
-            if ((state->flags & NFAStateFlag_IsAccepting) == 0) {
-                Hopcroft_DFA_State_Node *node = arena_push_struct(scratch_memory, Hopcroft_DFA_State_Node);
-                node->state = state;
-                node->next = null;
-                sll_push_back(without_accepting_states[without_accepting_state_index]->first,
-                              without_accepting_states[without_accepting_state_index]->last,
-                              node);
-            }
-        }
-    }
-    
-    // NOTE(christian): the goal: refine this partition!
-    Hopcroft_Partition parition = { 0 };
-    dll_push_back(parition.first, parition.last, accepting_states[0]);
-    dll_push_back(parition.first, parition.last, without_accepting_states[0]);
-    
-    Hopcroft_Partition worklist = { 0 };
-    dll_push_back(worklist.first, worklist.last, accepting_states[1]);
-    dll_push_back(worklist.first, worklist.last, without_accepting_states[1]);
-    
-    while (worklist.first) {
-        Hopcroft_DFA_States *dequeued_states = worklist.first;
-        dll_remove(worklist.first, worklist.last, dequeued_states);
-        for (u64 char_index = 0;
-             char_index < dfa->alphabet.char_count;
-             char_index += 1) {
-            Memory_Arena *conflicts[] = { arena, scratch_memory };
-            Memory_Arena *image_memory = arena_get_scratch(conflicts, array_count(conflicts));
-            Temporary_Memory image_temp_memory = temp_mem_begin(image_memory);
-            
-            Hopcroft_DFA_State_Node *image = calculate_image(image_memory,
-                                                             dfa,
-                                                             dfa->alphabet.str[char_index],
-                                                             dequeued_states);
-            
-            for (Hopcroft_DFA_States *set_in_partition = parition.first;
-                 set_in_partition;
-                 ) {
-                
-                u64 intersect_node_count = 0;
-                Hopcroft_DFA_State_Node *intersect_states_with_image = null;
-                Hopcroft_DFA_State_Node *last_in_intersect_states_with_image = null;
-                
-                for (Hopcroft_DFA_State_Node *state_in_set_parition = set_in_partition->first;
-                     state_in_set_parition;
-                     state_in_set_parition = state_in_set_parition->next) {
-                    for (Hopcroft_DFA_State_Node *image_node = image;
-                         image_node;
-                         image_node = image_node->next) {
-                        if (state_in_set_parition->state == image_node->state) {
-                            Hopcroft_DFA_State_Node *new_intersect_node = arena_push_struct(scratch_memory,
-                                                                                            Hopcroft_DFA_State_Node);
-                            
-                            if (intersect_states_with_image == null) {
-                                last_in_intersect_states_with_image = new_intersect_node;
-                            }
-                            
-                            new_intersect_node->state = image_node->state;
-                            new_intersect_node->next = intersect_states_with_image;
-                            intersect_states_with_image = new_intersect_node;
-                            
-                            intersect_node_count += 1;
+    for (nfa_state *possible_candidate = dfa->first_state;
+         possible_candidate;
+         possible_candidate = possible_candidate->next) {
+        nfa_transition *transitions = nfa_get_transitions_for_state(dfa, possible_candidate);
+        if (transitions) {
+            for (nfa_transition_node *transition = transitions->transitions;
+                 transition;
+                 transition = transition->next) {
+                b32 accept_candidate = false;
+                if (!transition->is_epsilon_transition && (transition->edge_label == character)) {
+                    for (Hopcroft_DFA_State_Node *possible_transition_to = transition_to->first;
+                         possible_transition_to;
+                         possible_transition_to = possible_transition_to->next) {
+                        if (possible_transition_to->state == transition->state) {
+                            accept_candidate = true;
+                            break;
                         }
                     }
                 }
                 
-                if (intersect_states_with_image) {
-                    u64 not_in_intersect_count = 0;
-                    Hopcroft_DFA_State_Node *set_in_partition_not_in_intersect = null;
-                    Hopcroft_DFA_State_Node *last_in_set_in_partition_not_in_intersect = null;
-                    for (Hopcroft_DFA_State_Node *state_in_set_parition = set_in_partition->first;
-                         state_in_set_parition;
-                         state_in_set_parition = state_in_set_parition->next) {
-                        for (Hopcroft_DFA_State_Node *intersect_node = intersect_states_with_image;
-                             intersect_node;
-                             intersect_node = intersect_node->next) {
-                            if (state_in_set_parition->state != intersect_node->state) {
-                                Hopcroft_DFA_State_Node *new_not_intersect_node = arena_push_struct(scratch_memory,
-                                                                                                    Hopcroft_DFA_State_Node);
-                                
-                                if (set_in_partition_not_in_intersect == null) {
-                                    last_in_set_in_partition_not_in_intersect = new_not_intersect_node;
-                                }
-                                
-                                new_not_intersect_node->state = state_in_set_parition->state;
-                                new_not_intersect_node->next = set_in_partition_not_in_intersect;
-                                set_in_partition_not_in_intersect = new_not_intersect_node;
-                                
-                                ++not_in_intersect_count;
-                            }
+                if (accept_candidate) {
+                    Hopcroft_DFA_State_Node *new_state_node = arena_push_struct(arena, Hopcroft_DFA_State_Node);
+                    new_state_node->state = possible_candidate;
+                    new_state_node->next = result;
+                    result = new_state_node;
+                    break;
+                }
+            }
+        }
+    }
+    
+    return(result);
+}
+
+// TODO(christian): after this, review BFS and DFS in CLRS!
+// TODO(christian): still flawed and I don't know where. Re read this!
+// TODO(christian): read the entire chapter again after this !!
+fn void
+dfa_minimize_hopcroft(Memory_Arena *arena, nfa *dfa) {
+    nfa result_minimized = { 0 }; // TODO(christian): this thang.
+    
+    Memory_Arena *partition_scratch = arena_get_scratch(&arena, 1);
+    Temporary_Memory partition_temporary_memory = temp_mem_begin(partition_scratch);
+    
+    Hopcroft_Partition partition = { 0 };
+    Hopcroft_Partition work_list = { 0 };
+    
+    {
+        Hopcroft_DFA_States *accepting_states[2], *without_accepting_states[2];
+        
+        for (u32 state_index = 0;
+             state_index < 2;
+             state_index += 1) {
+            accepting_states[state_index] = arena_push_struct_zero(partition_scratch, Hopcroft_DFA_States);
+            for (nfa_state *state = dfa->first_state;
+                 state;
+                 state = state->next) {
+                if (state->flags & NFAStateFlag_IsAccepting) {
+                    Hopcroft_DFA_State_Node *new_state_node = arena_push_struct(partition_scratch, Hopcroft_DFA_State_Node);
+                    new_state_node->state = state;
+                    new_state_node->next = null;
+                    sll_push_back(accepting_states[state_index]->first,
+                                  accepting_states[state_index]->last,
+                                  new_state_node);
+                }
+            }
+        }
+        
+        for (u32 state_index = 0;
+             state_index < 2;
+             state_index += 1) {
+            without_accepting_states[state_index] = arena_push_struct_zero(partition_scratch, Hopcroft_DFA_States);
+            for (nfa_state *state = dfa->first_state;
+                 state;
+                 state = state->next) {
+                if ((state->flags & NFAStateFlag_IsAccepting) == 0) {
+                    Hopcroft_DFA_State_Node *new_state_node = arena_push_struct(partition_scratch, Hopcroft_DFA_State_Node);
+                    new_state_node->state = state;
+                    new_state_node->next = null;
+                    sll_push_back(without_accepting_states[state_index]->first,
+                                  without_accepting_states[state_index]->last,
+                                  new_state_node);
+                }
+            }
+        }
+        
+        dll_push_back(partition.first, partition.last, accepting_states[0]);
+        dll_push_back(partition.first, partition.last, without_accepting_states[0]);
+        
+        dll_push_back(work_list.first, work_list.last, accepting_states[1]);
+        dll_push_back(work_list.first, work_list.last, without_accepting_states[1]);
+    }
+    
+    while (work_list.first) {
+        Hopcroft_DFA_States *popped_states_from_work = work_list.first;
+        dll_remove(work_list.first, work_list.last, popped_states_from_work);
+        
+        for (u32 alphabet_index = 0;
+             alphabet_index < dfa->alphabet.char_count;
+             alphabet_index += 1) {
+            u8 character = dfa->alphabet.str[alphabet_index];
+            Hopcroft_DFA_State_Node *image = dfa_get_states_that_transition_to_another_states(partition_scratch,
+                                                                                              dfa, character,
+                                                                                              popped_states_from_work);
+            
+            typedef struct State_In_Image_View State_In_Image_View;
+            struct State_In_Image_View {
+                Hopcroft_DFA_States *states;
+                State_In_Image_View *next;
+            };
+            
+            State_In_Image_View *states_in_partition_with_state_in_image = null;
+            for (Hopcroft_DFA_States *states_in_partition = partition.first;
+                 states_in_partition; 
+                 states_in_partition = states_in_partition->next) {
+                State_In_Image_View *accepted  = null;
+                for (Hopcroft_DFA_State_Node *state_in_partition = states_in_partition->first;
+                     state_in_partition && !accepted;
+                     state_in_partition = state_in_partition->next) {
+                    for (Hopcroft_DFA_State_Node *state_in_image = image;
+                         state_in_image;
+                         state_in_image = state_in_image->next) {
+                        // NOTE(christian): we have found a state in image.
+                        if (state_in_image->state == state_in_partition->state) {
+                            accepted = arena_push_struct_zero(partition_scratch, State_In_Image_View);
+                            accepted->states = states_in_partition;
+                            accepted->next = states_in_partition_with_state_in_image;
+                            states_in_partition_with_state_in_image = accepted;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            for (; states_in_partition_with_state_in_image; 
+                 states_in_partition_with_state_in_image = states_in_partition_with_state_in_image->next) {
+                u64 intersected_with_image_count = 0;
+                Hopcroft_DFA_State_Node *intersected_with_image = null;
+                Hopcroft_DFA_State_Node *last_in_intersected_with_image = null;
+                
+                u64 not_intersected_with_image_count = 0;
+                Hopcroft_DFA_State_Node *not_intersected_with_image = null;
+                Hopcroft_DFA_State_Node *last_in_not_intersected_with_image = null;
+                
+                for (Hopcroft_DFA_State_Node *state_node = states_in_partition_with_state_in_image->states->first;
+                     state_node;
+                     state_node = state_node->next) {
+                    b32 in_intersection = false;
+                    for (Hopcroft_DFA_State_Node *state_in_image = image;
+                         state_in_image;
+                         state_in_image = state_in_image->next) {
+                        if (state_in_image->state == state_node->state) {
+                            in_intersection = true;
+                            break;
                         }
                     }
                     
-                    if (set_in_partition_not_in_intersect) {
-                        Hopcroft_DFA_States *removed = set_in_partition;
-                        set_in_partition = set_in_partition->next;
-                        
-                        dll_remove(parition.first, parition.last, removed);
-                        
-                        // TODO(christian): obviously, we need a facility on copying these lists!
-                        Hopcroft_DFA_States *new_partition = arena_push_struct(scratch_memory, Hopcroft_DFA_States);
-                        new_partition->first = set_in_partition_not_in_intersect;
-                        new_partition->last = last_in_set_in_partition_not_in_intersect;
-                        new_partition->next = null;
-                        new_partition->prev = null;
-                        dll_push_back(parition.first, parition.last, new_partition);
-                        
-                        new_partition = arena_push_struct(scratch_memory, Hopcroft_DFA_States);
-                        new_partition->first = intersect_states_with_image;
-                        new_partition->last = last_in_intersect_states_with_image;
-                        new_partition->prev = null;
-                        dll_push_back(parition.first, parition.last, new_partition);
-                        
-                        // TODO(christian): we clearly need a function of linked list set equality!
-                        Hopcroft_DFA_States *position_of_queued = null;
-                        for (Hopcroft_DFA_States *queued_states = worklist.first;
-                             queued_states;
-                             queued_states = queued_states->next) {
-                            Hopcroft_DFA_State_Node *first_list = removed->first;
-                            Hopcroft_DFA_State_Node *second_list = queued_states->first;
-                            
-                            while (first_list != null) {
-                                b32 found_element = false;
-                                Hopcroft_DFA_State_Node *_second_list = second_list;
-                                while (_second_list) {
-                                    if (first_list->state == _second_list->state) {
-                                        found_element = true;
-                                        break;
-                                    } else {
-                                        _second_list = _second_list->next;
-                                    }
-                                }
-                                
-                                if (!found_element) {
-                                    break;
-                                }
-                                
-                                first_list = first_list->next;
-                            }
-                            
-                            if (first_list == null) {
-                                position_of_queued = queued_states;
-                                break;
-                            }
+                    if (in_intersection) {
+                        Hopcroft_DFA_State_Node *new_node = arena_push_struct(partition_scratch, Hopcroft_DFA_State_Node);
+                        new_node->next = intersected_with_image;
+                        new_node->state = state_node->state;
+                        intersected_with_image = new_node;
+                        if (!last_in_intersected_with_image) {
+                            last_in_intersected_with_image = new_node;
                         }
                         
-                        if (position_of_queued) {
-                            dll_remove(worklist.first, worklist.last, position_of_queued);
-                            
-                            new_partition = hopcroft_dfa_states_copy(scratch_memory, parition.last->prev);
-                            dll_push_back(worklist.first, worklist.last, new_partition);
-                            
-                            new_partition = hopcroft_dfa_states_copy(scratch_memory, parition.last);
-                            dll_push_back(worklist.first, worklist.last, new_partition);
-                        } else if (intersect_node_count <= not_in_intersect_count) {
-                            new_partition = hopcroft_dfa_states_copy(scratch_memory, parition.last->prev);
-                            dll_push_back(worklist.first, worklist.last, new_partition);
-                        } else {
-                            new_partition = hopcroft_dfa_states_copy(scratch_memory, parition.last);
-                            dll_push_back(worklist.first, worklist.last, new_partition);
+                        intersected_with_image_count += 1;
+                    }
+                }
+                
+                for (Hopcroft_DFA_State_Node *state_node = states_in_partition_with_state_in_image->states->first;
+                     state_node;
+                     state_node = state_node->next) {
+                    b32 not_in_intersection = true;
+                    for (Hopcroft_DFA_State_Node *state_in_intersected_with_image = intersected_with_image;
+                         state_in_intersected_with_image;
+                         state_in_intersected_with_image = state_in_intersected_with_image->next) {
+                        if (state_in_intersected_with_image->state == state_node->state) {
+                            not_in_intersection = false;
+                            break;
+                        }
+                    }
+                    
+                    if (not_in_intersection) {
+                        Hopcroft_DFA_State_Node *new_node = arena_push_struct(partition_scratch, Hopcroft_DFA_State_Node);
+                        new_node->state = state_node->state;
+                        new_node->next = not_intersected_with_image;
+                        not_intersected_with_image = new_node;
+                        if (!last_in_not_intersected_with_image) {
+                            last_in_not_intersected_with_image = new_node;
                         }
                         
-                        Hopcroft_DFA_State_Node *first_list = removed->first;
+                        not_intersected_with_image_count += 1;
+                    }
+                }
+                
+                if (not_intersected_with_image != null) {
+                    dll_remove(partition.first, partition.last, states_in_partition_with_state_in_image->states);
+                    
+                    Hopcroft_DFA_States *new_partition_state = arena_push_struct_zero(partition_scratch, Hopcroft_DFA_States);
+                    new_partition_state->first = intersected_with_image;
+                    new_partition_state->last = last_in_intersected_with_image;
+                    dll_push_back(partition.first, partition.last, new_partition_state);
+                    
+                    new_partition_state = arena_push_struct_zero(partition_scratch, Hopcroft_DFA_States);
+                    new_partition_state->first = not_intersected_with_image;
+                    new_partition_state->last = last_in_not_intersected_with_image;
+                    dll_push_back(partition.first, partition.last, new_partition_state);
+                    
+                    // TODO(christian): we clearly need a function of linked list set equality!
+                    Hopcroft_DFA_States *position_of_queued = null;
+                    for (Hopcroft_DFA_States *queued_states = work_list.first;
+                         queued_states;
+                         queued_states = queued_states->next) {
+                        Hopcroft_DFA_State_Node *first_list = states_in_partition_with_state_in_image->states->first;
+                        Hopcroft_DFA_State_Node *second_list = queued_states->first;
+                        
                         while (first_list != null) {
                             b32 found_element = false;
-                            Hopcroft_DFA_State_Node *_second_list = dequeued_states->first;
+                            Hopcroft_DFA_State_Node *_second_list = second_list;
                             while (_second_list) {
                                 if (first_list->state == _second_list->state) {
                                     found_element = true;
@@ -1488,62 +1522,52 @@ dfa_minimize(Memory_Arena *arena, nfa *dfa) {
                         }
                         
                         if (first_list == null) {
+                            position_of_queued = queued_states;
                             break;
                         }
-                    } else {
-                        set_in_partition = set_in_partition->next;
                     }
-                } else {
-                    set_in_partition = set_in_partition->next;
+                    
+                    if (position_of_queued) {
+                        dll_remove(work_list.first, work_list.last, position_of_queued);
+                        
+                        new_partition_state = hopcroft_dfa_states_copy(partition_scratch, partition.last->prev);
+                        dll_push_back(work_list.first, work_list.last, new_partition_state);
+                        
+                        new_partition_state = hopcroft_dfa_states_copy(partition_scratch, partition.last);
+                        dll_push_back(work_list.first, work_list.last, new_partition_state);
+                    } else if (intersected_with_image_count <= not_intersected_with_image_count) {
+                        new_partition_state = hopcroft_dfa_states_copy(partition_scratch, partition.last->prev);
+                        dll_push_back(work_list.first, work_list.last, new_partition_state);
+                    } else {
+                        new_partition_state = hopcroft_dfa_states_copy(partition_scratch, partition.last);
+                        dll_push_back(work_list.first, work_list.last, new_partition_state);
+                    }
+                    
+                    Hopcroft_DFA_State_Node *first_list = popped_states_from_work->first;
+                    while (first_list != null) {
+                        b32 found_element = false;
+                        Hopcroft_DFA_State_Node *_second_list = states_in_partition_with_state_in_image->states->first;
+                        while (_second_list) {
+                            if (first_list->state == _second_list->state) {
+                                found_element = true;
+                                break;
+                            } else {
+                                _second_list = _second_list->next;
+                            }
+                        }
+                        
+                        if (!found_element) {
+                            break;
+                        }
+                        
+                        first_list = first_list->next;
+                    }
+                    
+                    if (first_list == null) {
+                        break;
+                    }
                 }
             }
-            
-            temp_mem_end(image_temp_memory);
-        }
-    }
-    
-    temp_mem_end(temporary_memory);
-}
-
-// Hopcroft Algorithm notes:
-// - It constructs a minimal DFA from an arbitrary DFA by grouping together states into sets that are equivalent.
-// - Two DFA states are equivalent when they produce the same behavior on input string.
-// - It finds the largest possible sets of equivalent states; each set becomes a state in the minimal DFA. 
-//    - From my understanding, it condenses these equivalent states into one state.
-// - It constructs a set partition, P = { p_1, ..., p_m } of DFA states. Each p_i contains a set of equivalent
-//   DFA States. Basically, P is a set of sets! Remember this!
-// - It constructs a partition with the smallest number of sets. Here are the following rules without annoying math formalness:
-// 
-//   1. Suppose we have character c in the alphabet. Suppose we have DFA States d_i and d_j in some partition p_i in P.
-//      Suppose we have DFA states d_x and d_y such that d_i transitions to d_x with respect to character c and
-//      d_j transitions to d_y with respect to character c. Then, d_x and d_j must belong into the same partition
-//      p_t in P!
-//      - In other words, two states in the same set must, for every character c in alphabet, transition to states that are themselves, members
-//        of a single set in partition!
-// 
-//   2. Suppose we have DFA states d_i and d_j in some partition p_k in P. Then both d_i and d_j must be an accepting state!
-//      Or both d_i and d_j must be a nonaccepting state! But not both!
-//      - Any single set contains either accepting states or nonaccepting states, but not both!
-
-// - The algorithm starts with P containg two sets: {accepting states} and {all DFA states without accepting states}.
-// - The algorithm refines P's contents until both properties 1 and 2 holds for each set in P.
-// - The algorithm splits sets based on the transitions out of DFA states in the set.
-
-// TODO(christian): after this, review BFS and DFS in CLRS!
-fn void
-dfa_minimize_hopcroft(Memory_Arena *arena, nfa *dfa) {
-    Memory_Arena *partition_scratch = arena_get_scratch(&arena, 1);
-    Temporary_Memory partition_temporary_memory = temp_mem_begin(partition_scratch);
-    
-    Hopcroft_Partition partition;
-    Hopcroft_Partition work_list;
-    
-    {
-        Hopcroft_DFA_States *accepting_states[2], *without_accepting_states[2];
-        for (nfa_state *state = dfa->first_state;
-             state;
-             state = state->next) {
-            Hopcroft_DFA_States *new_state_group = arena_push_struct(partition_scratch, Hopcroft_DFA_States);
         }
     }
     
@@ -1558,16 +1582,20 @@ main(int argc, char *argv[]) {
     String_U8 buf = w32_read_entire_file(main_arena, str8("..\\code\\scratch\\test_program.c"));
     scan_begin(main_arena, buf);
     
-    nfa test_nfa = nfa_from_regex(main_arena, str8("a.(b|c)*"));
+    //nfa test_nfa = nfa_from_regex(main_arena, str8("a.(b|c)*"));
     //nfa_follow_epsilon_result *aaa = nfa_follow_epsilon(main_arena, &test_nfa, test_nfa.first_state->next);
-    //nfa test_nfa = nfa_from_regex(main_arena, str8("a.(b|c)*.f")); // a(b|c)*f
+    nfa test_nfa = nfa_from_regex(main_arena, str8("a.(b|c)*.f")); // a(b|c)*f
     //nfa test_nfa = nfa_from_regex(main_arena, str8("a.a*.b"));
+    // TODO(christian): this thing doesnt work with this regex. YIIIKES! FIX THIS!
+    //nfa test_nfa = nfa_from_regex(main_arena, str8("(b.g.h)|(f.i.e)"));
     
     nfa test_dfa = dfa_from_nfa(main_arena, &test_nfa);
-    dfa_minimize(main_arena, &test_dfa);
     //nfa_valid_configuration *c = nfa_follow_epsilon(main_arena, &test_nfa, test_nfa.first_state->next->next->next);
     
     nfa_print_states_and_transitions(&test_dfa);
+    puts("\n\n");
+    nfa_print_states_and_transitions(&test_nfa);
+    dfa_minimize_hopcroft(main_arena, &test_dfa);
     printf("\nnfa alphabet: %s", (char *)test_nfa.alphabet.str);
     //getc(stdin);
     return(0);
